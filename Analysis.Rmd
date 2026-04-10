@@ -1,0 +1,627 @@
+---
+title: "ABitOfMe_UMAP26"
+output: html_document
+date: "2026-03-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(glmnet) 
+library(caret) 
+library(simr) 
+library(lsa) 
+library(lme4) 
+library(lmerTest) 
+library(MASS)
+library(car)
+library(broom.mixed)
+library(scales)
+library(MuMIn)
+library(glmmLasso)
+```
+
+```{r load_data}
+#only inclucde receivers who wrote at least 60 words
+data <- read_csv("data.csv")
+data <- data |> filter(WC_receiver >= 60) 
+
+```
+
+```{r GLM}
+data <- read_csv("data.csv", show_col_types = FALSE) %>%
+  filter(WC_receiver >= 60)
+
+model_data <- data %>%
+  dplyr::select(persuasion_score, receiverID, statementID)
+
+#predictor sets below:
+
+#LIWC
+liwc_statement <- names(data %>% dplyr::select(Segment_statement:Emoji_statement))
+liwc_receiver <- names(data %>% dplyr::select(Segment_receiver:Emoji_receiver))
+  
+#CONTENT
+content_statement <- names(data %>% dplyr::select(Questions_statement:alternatives_statement))
+content_receiver <- names(data %>% dplyr::select(Questions_receiver:alternatives_receiver)) 
+  
+#PERSONALITY
+personality_statement <- names(data %>% dplyr::select(extraversion_statement:neuroticism_statement))
+personality_receiver <- names(data %>% dplyr::select(extraversion_receiver:neuroticism_receiver))
+  
+#DEMOGRAPHICS
+demographics_receiver <- names(data %>% dplyr::select(gender_receiver, age_receiver, educationlevel_receiver))
+demographics_statement <- names(data %>% dplyr::select(gender_statement, age_statement, educationlevel_statement))
+
+x_cols <- personality_statement
+#choose any from above sets of predictors
+
+predictors <- data %>% dplyr::select(all_of(x_cols)) 
+
+# keep only nonzero-variance predictors
+vars <- vapply(predictors, \(x) var(x, na.rm = TRUE), numeric(1))
+nonzero_vars <- names(vars)[is.finite(vars) & vars > 0]
+
+predictors_scaled <- predictors %>%
+  dplyr::select(all_of(nonzero_vars)) %>%
+  mutate(across(everything(), ~ as.numeric(scale(.))))
+
+model_data <- bind_cols(model_data, predictors_scaled)
+
+model_data_glm <- model_data %>%
+  dplyr::select(-receiverID, -statementID) %>%
+  na.omit() %>%
+  as.data.frame()
+
+glm_full <- glm(persuasion_score ~ ., data = model_data_glm)
+
+#function to remove aliased and high-VIF predictors
+remove_alias_and_high_vif_vars <- function(data, response = "persuasion_score", vars, cutoff = 5) {
+  vars <- setdiff(vars, response)
+
+  repeat {
+    fml <- as.formula(paste(response, "~", paste(vars, collapse = " + ")))
+    m <- glm(fml, data = data)
+
+    #remove aliased columns (there were some in liwc_statement)
+    aliased <- setdiff(names(coef(m))[is.na(coef(m))], "(Intercept)")
+    if (length(aliased) > 0) {
+      drop_var <- intersect(aliased, vars)[1]
+      if (is.na(drop_var)) drop_var <- vars[1]
+#     cat("Removing aliased:", drop_var, "\n")
+      vars <- setdiff(vars, drop_var)
+      next
+    }
+
+    #get VIF, remove any NA VIF first
+    v <- car::vif(m)
+    if (is.matrix(v)) v <- v[, 1]
+    if (anyNA(v)) {
+      drop_var <- names(v)[which(is.na(v))[1]]
+#     cat("Removing NA VIF:", drop_var, "\n")
+      vars <- setdiff(vars, drop_var)
+      next
+    }
+
+    if (all(v < cutoff)) break
+
+    #remove high VIF
+    high_vif <- names(which.max(v))
+#   cat("Removing high VIF:", high_vif, "(VIF =", round(max(v), 2), ")\n")
+    vars <- setdiff(vars, high_vif)
+  }
+
+  vars
+}
+
+#apply to model
+model_data_glm <- as.data.frame(model_data_glm)
+vars0 <- setdiff(names(model_data_glm), "persuasion_score")
+vars_kept <- remove_alias_and_high_vif_vars(model_data_glm, vars = vars0, cutoff = 5)
+
+glm_vif_filtered <- glm(
+  as.formula(paste("persuasion_score ~", paste(vars_kept, collapse = " + "))),
+  data = model_data_glm
+)
+
+#stepwise model on remaining predictors
+stepwise_model <- step(glm_vif_filtered, direction = "both", trace = TRUE)
+
+#refit glm with remaining predictors
+fixed_part <- paste(names(coef(stepwise_model))[-1], collapse = " + ")
+glm_formula <- if (nzchar(fixed_part)) as.formula(paste("persuasion_score ~", fixed_part)) else persuasion_score ~ 1
+
+final_model <- glm(glm_formula, data = model_data_glm)
+summary(final_model)
+
+#pseudo-Rsq
+r_squared <- 1 - (final_model$deviance / final_model$null.deviance)
+r_squared
+
+# Likelihood ratio test
+null_model <- glm(persuasion_score ~ 1, data = model_data_glm)
+anova(null_model, final_model, test = "Chisq")
+
+
+
+```
+
+```{r mixed_lasso}
+
+set.seed(123)
+
+#re-load data if re-running
+data <- read_csv("data.csv", show_col_types = FALSE) %>%
+  filter(WC_receiver >= 60)
+
+#predictor sets below:
+
+#LIWC
+liwc_statement <- names(data %>% dplyr::select(Segment_statement:Emoji_statement))
+liwc_receiver <- names(data %>% dplyr::select(Segment_receiver:Emoji_receiver))
+  
+#CONTENT
+content_statement <- names(data %>% dplyr::select(Questions_statement:alternatives_statement))
+content_receiver <- names(data %>% dplyr::select(Questions_receiver:alternatives_receiver)) 
+  
+#PERSONALITY
+personality_statement <- names(data %>% dplyr::select(extraversion_statement:neuroticism_statement))
+personality_receiver <- names(data %>% dplyr::select(extraversion_receiver:neuroticism_receiver))
+  
+#DEMOGRAPHICS
+demographics_statement <- names(data %>% dplyr::select(gender_receiver, age_receiver, educationlevel_receiver))
+demographics_receiver <- names(data %>% dplyr::select(gender_statement, age_statement, educationlevel_statement))
+
+
+predictors <- liwc_receiver #choose any from above sets of predictors
+
+
+data <- data %>%
+  dplyr::select(all_of(predictors), persuasion_score, receiverID, statementID) %>%
+  mutate(
+    receiverID = as.factor(receiverID),
+    statementID = as.factor(statementID)
+  ) %>%
+  filter(complete.cases(.)) %>%
+  as.data.frame()
+
+# drop zero-variance predictors and scale
+sds <- vapply(data[, predictors, drop = FALSE], sd, numeric(1), na.rm = TRUE)
+predictors <- predictors[is.finite(sds) & sds > 0]
+
+data[, predictors] <- lapply(data[, predictors, drop = FALSE], \(x) as.numeric(scale(x)))
+
+
+#lmer formula
+random_list <- list(receiverID = ~1, statementID = ~1)
+fixed_formula <- as.formula(paste("persuasion_score ~", paste(predictors, collapse = " + ")))
+
+#function to choose best lambda to minimise AIC 
+lambda_grid <- 10^seq(from = -2, to = 3, length.out = 16) # 16 equally spaced lambda values on a log scale 
+aic_tbl <- data.frame(lambda = lambda_grid, n_selected = NA_integer_, AIC_lmer = NA_real_)
+lasso_models <- vector("list", length(lambda_grid))
+
+for (i in seq_along(lambda_grid)) {
+  lam <- lambda_grid[i]
+#  cat("Lambda:", lam, "\n")
+
+  lasso <- tryCatch(
+    glmmLasso(
+      fixed_formula,
+      rnd = random_list,
+      data = data,
+      lambda = lam,
+      family = gaussian(link = "identity")
+    ),
+    error = function(e) NULL
+  )
+  lasso_models[[i]] <- lasso
+  if (is.null(lasso)) next
+
+  selected <- setdiff(names(lasso$coeff)[lasso$coeff != 0], "(Intercept)")
+#  aic_tbl$n_selected[i] <- length(selected)
+
+  fml <- if (length(selected) == 0) {
+    persuasion_score ~ 1 + (1 | receiverID) + (1 | statementID)
+  } else {
+    as.formula(paste(
+      "persuasion_score ~", paste(selected, collapse = " + "),
+      "+ (1 | receiverID) + (1 | statementID)"
+    ))
+  }
+
+  lmer_fit <- tryCatch(lmer(fml, data = data, REML = FALSE), error = function(e) NULL)
+  if (!is.null(lmer_fit)) aic_tbl$AIC_lmer[i] <- AIC(lmer_fit)
+}
+
+aic_tbl <- aic_tbl[order(aic_tbl$AIC_lmer), ]
+print(aic_tbl)
+
+valid <- which(is.finite(aic_tbl$AIC_lmer))
+best_i <- valid[which.min(aic_tbl$AIC_lmer[valid])] #select index of min AIC
+best_lambda <- aic_tbl$lambda[best_i] #and the corresponding lambda
+cat("Best lambda (lmer AIC):", best_lambda, "\n")
+
+
+#fit lasso with best lambda
+glmm_lasso_model <- lasso_models[[best_i]]
+if (is.null(glmm_lasso_model)) {
+  glmm_lasso_model <- glmmLasso(
+    fixed_formula,
+    rnd = random_list,
+    data = data,
+    lambda = best_lambda,
+    family = gaussian(link = "identity")
+  )
+}
+
+#fit lmer with remaining predictors (to get estimates, pvalues etc)
+selected_vars <- setdiff(names(glmm_lasso_model$coeff)[glmm_lasso_model$coeff != 0], "(Intercept)")
+#print(selected_vars)
+
+final_formula <- if (length(selected_vars) == 0) {
+  persuasion_score ~ 1 + (1 | receiverID) + (1 | statementID)
+} else {
+  as.formula(paste(
+    "persuasion_score ~", paste(selected_vars, collapse = " + "),
+    "+ (1 | receiverID) + (1 | statementID)"
+  ))
+}
+
+final_lmer_ml <- lmer(final_formula, data = data, REML = FALSE)
+final_lmer <- update(final_lmer_ml, REML = TRUE)
+summary(final_lmer)
+# 10-fold cross-validated RMSE
+k <- 10
+folds <- sample(rep(1:k, length.out = nrow(data)))
+rmse_vec <- numeric(k)
+for (i in 1:k) {
+  train_data <- data[folds != i, , drop = FALSE]
+  test_data  <- data[folds == i, , drop = FALSE]
+  m <- lmer(final_formula, data = train_data, REML = TRUE)
+  preds <- predict(m, newdata = test_data, allow.new.levels = TRUE)
+  rmse_vec[i] <- sqrt(mean((test_data$persuasion_score - preds)^2))
+}
+cv_rmse <- mean(rmse_vec)
+cv_rmse
+
+#lmer results
+r2 <- r.squaredGLMM(final_lmer)
+r2
+
+summary(final_lmer)
+AIC(final_lmer)
+
+#likelihood ratio test
+null_lmer_ml <- lmer(persuasion_score ~ 1 + (1 | receiverID) + (1 | statementID), data = data, REML = FALSE)
+anova(null_lmer_ml, final_lmer_ml)
+AIC(null_lmer_ml); AIC(final_lmer_ml)
+
+
+
+```
+
+
+```{r similarity_df}
+data <- read_csv("data.csv", show_col_types = FALSE) %>%
+  filter(WC_receiver >= 60)
+
+#all features
+features <- c(
+  "Segment", "WC", "Analytic", "Clout", "Authentic", "Tone",
+  "WPS", "BigWords", "Dic", "function", "pronoun", "ppron",
+  "i", "we", "you", "shehe", "they", "ipron", "det", "article",
+  "number", "prep", "auxverb", "adverb", "conj", "negate",
+  "verb", "adj", "quantity", "Drives", "affiliation", "achieve",
+  "power", "Cognition", "allnone", "cogproc", "insight", "cause",
+  "discrep", "tentat", "certitude", "differ", "memory", "Affect",
+  "tone_pos", "tone_neg", "emotion", "emo_pos", "emo_neg",
+  "emo_anx", "emo_anger", "emo_sad", "swear", "Social",
+  "socbehav", "prosocial", "polite", "conflict", "moral",
+  "comm", "socrefs", "family", "friend", "female", "male",
+  "Culture", "politic", "ethnicity", "tech", "Lifestyle",
+  "leisure", "home", "work", "money", "relig", "Physical",
+  "health", "illness", "wellness", "mental", "substances",
+  "sexual", "food", "death", "need", "want", "acquire",
+  "lack", "fulfill", "fatigue", "reward", "risk",
+  "curiosity", "allure", "Perception", "attention", "motion",
+  "space", "visual", "auditory", "feeling", "time",
+  "focuspast", "focuspresent", "focusfuture", "Conversation",
+  "netspeak", "assent", "nonflu", "filler", "AllPunc",
+  "Period", "Comma", "QMark", "Exclam", "Apostro",
+  "OtherP", "Emoji",
+  "Questions", "Social_pressure", "Pleasant_Experience",
+  "Health_reasons", "Financial_reasons", "Ethical_reasons",
+  "Environmental_reasons", "Easy_to_do", "Praise",
+  "Offers_to_Help", "Criticism", "Barriers",
+  "Start_small", "Practical_steps", "alternatives", "extraversion",
+  "agreeableness", "conscientiousness", "neuroticism",
+  "openness", "age", "gender", "educationlevel"
+)
+
+author_cols <- paste0(features, "_statement")
+receiver_cols  <- paste0(features, "_receiver")
+
+data[author_cols] <- lapply(data[author_cols], function(x) as.numeric(as.character(x)))
+data[receiver_cols]  <- lapply(data[receiver_cols], function(x) as.numeric(as.character(x)))
+
+#initialise similarity dataframe
+similarity_df <- data %>% dplyr::select(statementID, receiverID, persuasion_score)
+
+#compute similarity feature-by-feature
+for (feat in features) {
+  author_col <- paste0(feat, "_statement")
+  receiver_col  <- paste0(feat, "_receiver")
+  
+  similarity_df[[paste0("sim_", feat)]] <- 1 - abs(data[[receiver_col]] - data[[author_col]]) / 
+    pmax(abs(data[[receiver_col]]), abs(data[[author_col]]), 1e-6)
+}
+
+write_csv(similarity_df, "similarity_df.csv")
+
+similarity_df <- similarity_df %>% na.omit()
+
+
+
+```
+
+```{r GLM_similarity}
+similarity_df <- read_csv("similarity_df.csv", show_col_types = FALSE)
+
+model_data <- similarity_df %>%
+  dplyr::select(persuasion_score, receiverID, statementID)
+
+#predictor sets
+liwc_content_similarity <- similarity_df%>% dplyr::select(sim_Segment:sim_Practical_steps)
+personality_similarity <- similarity_df %>% dplyr::select(sim_extraversion:sim_openness)
+demographics_similarity <- similarity_df %>% dplyr::select(sim_gender, sim_age, sim_educationlevel)
+combined <- similarity_df %>% dplyr::select(sim_Segment:sim_Practical_steps, sim_extraversion:sim_openness, sim_gender, sim_age, sim_educationlevel)
+
+predictors <-  demographics_similarity#choose any of the sets
+
+# keep only nonzero-variance predictors
+vars <- vapply(predictors, \(x) var(x, na.rm = TRUE), numeric(1))
+nonzero_vars <- names(vars)[is.finite(vars) & vars > 0]
+
+#scale
+predictors_scaled <- predictors %>%
+  dplyr::select(all_of(nonzero_vars)) %>%
+  mutate(across(everything(), ~ as.numeric(scale(.))))
+
+model_data <- bind_cols(model_data, predictors_scaled)
+
+model_data_glm <- model_data %>%
+  dplyr::select(-receiverID, -statementID) %>%
+  na.omit() %>%
+  as.data.frame()
+
+glm_full <- glm(persuasion_score ~ ., data = model_data_glm)
+
+#remove aliased and high-vif predictors
+remove_alias_and_high_vif_vars <- function(data, response = "persuasion_score", vars, cutoff = 5) {
+  vars <- setdiff(vars, response)
+
+  repeat {
+    fml <- as.formula(paste(response, "~", paste(vars, collapse = " + ")))
+    m <- glm(fml, data = data)
+
+    aliased <- setdiff(names(coef(m))[is.na(coef(m))], "(Intercept)")
+    if (length(aliased) > 0) {
+      drop_var <- intersect(aliased, vars)[1]
+      if (is.na(drop_var)) drop_var <- vars[1]
+      cat("Removing aliased:", drop_var, "\n")
+      vars <- setdiff(vars, drop_var)
+      next
+    }
+
+    v <- car::vif(m)
+    if (is.matrix(v)) v <- v[, 1]
+    if (anyNA(v)) {
+      drop_var <- names(v)[which(is.na(v))[1]]
+      cat("Removing NA VIF:", drop_var, "\n")
+      vars <- setdiff(vars, drop_var)
+      next
+    }
+
+    if (all(v < cutoff)) break
+
+    worst <- names(which.max(v))
+    cat("Removing high VIF:", worst, "(VIF =", round(max(v), 2), ")\n")
+    vars <- setdiff(vars, worst)
+  }
+
+  vars
+}
+
+model_data_glm <- as.data.frame(model_data_glm)
+
+#refit model with remaining predictors and run stepwise selection
+vars0 <- setdiff(names(model_data_glm), "persuasion_score")
+vars_kept <- remove_alias_and_high_vif_vars(model_data_glm, vars = vars0, cutoff = 5)
+
+glm_vif_filtered <- glm(
+  as.formula(paste("persuasion_score ~", paste(vars_kept, collapse = " + "))),
+  data = model_data_glm
+)
+
+stepwise_model <- step(glm_vif_filtered, direction = "both", trace = TRUE)
+
+
+# final GLM from selected terms
+fixed_part <- paste(names(coef(stepwise_model))[-1], collapse = " + ")
+glm_formula <- if (nzchar(fixed_part)) as.formula(paste("persuasion_score ~", fixed_part)) else persuasion_score ~ 1
+
+final_model <- glm(glm_formula, data = model_data_glm)
+summary(final_model)
+
+#pseudo Rsq
+r_squared <- 1 - (final_model$deviance / final_model$null.deviance)
+r_squared
+
+#likelihood ratio test
+null_model <- glm(persuasion_score ~ 1, data = model_data_glm)
+anova(null_model, final_model, test = "Chisq")
+
+
+```
+
+```{r lasso_similarity}
+
+#reload data (if running more than once)
+similarity_df <- read_csv("similarity_df.csv", show_col_types = FALSE)
+
+set.seed(123)
+
+#sets of similarity predictors
+liwc_cont_sim <- names(similarity_df |> dplyr::select(sim_Segment:sim_Practical_steps)) #similarity liwc+content
+pers_sim <- names(similarity_df |> dplyr::select(sim_extraversion:sim_openness)) #similarity personality
+dem_sim <- names(similarity_df |> dplyr::select(sim_gender, sim_age, sim_educationlevel)) #similarity demographics
+combined <- names(similarity_df |> dplyr::select(sim_Segment:sim_Practical_steps, sim_extraversion:sim_openness, sim_gender, sim_age, sim_educationlevel)) #all similarity predictors
+
+predictors <- pers_sim
+
+#choose best lambda from a sequence on a log scale
+lambda_grid <- 10^seq(from = -2, to = 3, length.out = 16)
+
+#initialise data and random effects
+similarity_df <- similarity_df %>%
+  dplyr::select(persuasion_score, receiverID, statementID, all_of(predictors)) %>%
+  mutate(
+    receiverID = as.factor(receiverID),
+    statementID = as.factor(statementID),
+    across(all_of(predictors), ~ as.numeric(as.character(.)))
+  ) %>%
+  na.omit() %>%
+  as.data.frame()
+
+# drop zero-variance predictors and scale
+sds <- vapply(similarity_df[, predictors, drop = FALSE], sd, numeric(1), na.rm = TRUE)
+predictors <- predictors[is.finite(sds) & sds > 0]
+
+similarity_df[, predictors] <-
+  lapply(similarity_df[, predictors, drop = FALSE], \(x) as.numeric(scale(x)))
+
+# model formula
+random_list <- list(receiverID = ~1, statementID = ~1)
+fixed_formula <- as.formula(paste("persuasion_score ~", paste(predictors, collapse = " + ")))
+
+#function to choose best lambda minimising AIC
+aic_tbl <- data.frame(lambda = lambda_grid, n_selected = NA_integer_, AIC_lmer = NA_real_)
+lasso_models <- vector("list", length(lambda_grid))
+
+
+for (i in seq_along(lambda_grid)) {
+  lam <- lambda_grid[i]
+
+  lasso <- tryCatch(
+    glmmLasso(
+      fixed_formula,
+      rnd = random_list,
+      data = similarity_df,
+      lambda = lam,
+      family = gaussian(link = "identity")
+    ),
+    error = function(e) NULL
+  )
+  lasso_models[[i]] <- lasso
+  if (is.null(lasso)) next
+
+  selected <- names(lasso$coeff)[lasso$coeff != 0]
+  selected <- setdiff(selected, "(Intercept)")
+  aic_tbl$n_selected[i] <- length(selected)
+
+  fml <- if (length(selected) == 0) {
+    persuasion_score ~ 1 + (1 | receiverID) + (1 | statementID)
+  } else {
+    as.formula(paste(
+      "persuasion_score ~", paste(selected, collapse = " + "),
+      "+ (1 | receiverID) + (1 | statementID)"
+    ))
+  }
+
+  lmer_fit <- tryCatch(
+    lmer(fml, data = similarity_df, REML = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(lmer_fit)) next
+
+  aic_tbl$AIC_lmer[i] <- AIC(lmer_fit)
+}
+
+aic_tbl <- aic_tbl[order(aic_tbl$AIC_lmer), ]
+
+
+
+
+valid <- which(is.finite(aic_tbl$AIC_lmer))
+best_i <- valid[which.min(aic_tbl$AIC_lmer[valid])] #select min AIC
+best_lambda <- aic_tbl$lambda[best_i] 
+cat("Best lambda (lmer AIC):", best_lambda, "\n")
+
+#fit lasso with best lambda
+glmm_lasso_model <- lasso_models[[best_i]]
+if (is.null(glmm_lasso_model)) {
+  glmm_lasso_model <- glmmLasso(
+    fixed_formula,
+    rnd = random_list,
+    data = similarity_df,
+    lambda = best_lambda,
+    family = gaussian(link = "identity")
+  )
+}
+
+#refit lmer with leftover variables (to get estimates, pvalues etc)
+
+selected_vars <- names(glmm_lasso_model$coeff)[glmm_lasso_model$coeff != 0]
+selected_vars <- setdiff(selected_vars, "(Intercept)")
+#cat("Selected predictors:", length(selected_vars), "\n")
+#print(selected_vars)
+final_formula <- if (length(selected_vars) == 0) {
+  persuasion_score ~ 1 + (1 | receiverID) + (1 | statementID)
+} else {
+  as.formula(paste(
+    "persuasion_score ~", paste(selected_vars, collapse = " + "),
+    "+ (1 | receiverID) + (1 | statementID)"
+  ))
+}
+
+
+#final model results
+final_ml   <- lmer(final_formula, data = similarity_df, REML = FALSE)
+
+summary(final_ml)
+MuMIn::r.squaredGLMM(final_ml)
+AIC(final_ml)
+
+
+#10-fold cross-validated RMSE
+k <- 10
+n <- nrow(similarity_df)
+folds <- sample(rep(1:k, length.out = n))
+rmse_vec <- numeric(k)
+
+for (fold in 1:k) {
+  train_data <- similarity_df[folds != fold, , drop = FALSE]
+  test_data  <- similarity_df[folds == fold, , drop = FALSE]
+  m <- lmer(final_formula, data = train_data, REML = FALSE)
+  preds <- predict(m, newdata = test_data, allow.new.levels = TRUE)
+  rmse_vec[fold] <- sqrt(mean((test_data$persuasion_score - preds)^2))
+}
+
+cv_rmse <- mean(rmse_vec)
+cv_rmse
+
+
+#likelihood ratio test
+null_ml <- lmer(persuasion_score ~ 1 + (1 | receiverID) + (1 | statementID),
+                data = similarity_df, REML = FALSE)
+anova(null_ml, final_ml)
+AIC(null_ml); AIC(final_ml)
+
+
+
+```
+
